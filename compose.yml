@@ -1,0 +1,32 @@
+services:
+  proof-server:
+    image: ghcr.io/midnight-ntwrk/proof-server:8.0.3
+    ports:
+      - "6300:6300"
+    healthcheck:
+      disable: true
+
+  indexer:
+    image: ghcr.io/midnight-ntwrk/indexer-standalone:4.0.0
+    ports:
+      - "8088:8088"
+    environment:
+      - INDEXER_STANDALONE_NODE_URL=ws://node:9944
+    depends_on:
+      node:
+        condition: service_healthy
+
+  node:
+    image: ghcr.io/midnight-ntwrk/midnight-node:0.22.3
+    ports:
+      - "9944:9944"
+    command:
+      - "--dev"
+      - "--rpc-external"
+      - "--rpc-cors=all"
+      - "--rpc-methods=unsafe"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9944/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
