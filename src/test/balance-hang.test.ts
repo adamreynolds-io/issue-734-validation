@@ -415,4 +415,94 @@ describe('gsd-wallet#10 / midnight-js#734: balanceUnsealedTransaction hang', () 
     logger.info(`mintAndReceive (post-serde): status=${txData.public.status}`);
     expect(txData.public.status).toBe('SucceedEntirely');
   }, 10 * 60_000);
+
+  // ── Test 6: Concurrent state access during balance ──────────────
+  // Simulates the browser environment where facade.state() subscription
+  // and sync operations run concurrently with balancing.
+  // The hypothesis: SubscriptionRef semaphore contention causes the hang.
+
+  it('balance with concurrent state reads — contention simulation', async () => {
+    expect(contractAddress).toBeDefined();
+
+    // Simulate what the browser does: continuously read wallet state
+    // while a balanceUnboundTransaction is in progress.
+    // This creates contention on the SubscriptionRef semaphores.
+    let stateReadCount = 0;
+    const statePoller = setInterval(async () => {
+      try {
+        const state = await Rx.firstValueFrom(wallet.wallet.state());
+        stateReadCount++;
+        // Simulate the serialization work the browser does on each emission
+        JSON.stringify({
+          shielded: state.shielded.state.progress,
+          unshielded: state.unshielded.progress,
+          dust: state.dust.state.progress,
+        });
+      } catch {
+        // Ignore errors during polling
+      }
+    }, 50); // Poll every 50ms — aggressive, simulating continuous subscription
+
+    try {
+      // Create, prove, serialize, deserialize — full DApp connector simulation
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const callData: any = await timed('createUnprovenCallTx-contention', () =>
+        (createUnprovenCallTx as any)(providers, {
+          compiledContract: CompiledTokenTransfersContract,
+          contractAddress,
+          circuitId: 'mintAndReceive',
+          args: [MINT_AMOUNT],
+        }),
+      );
+      const unprovenTx = callData.private.unprovenTx;
+
+      const provenTx = await timed('proveTx-contention', () =>
+        providers.proofProvider.proveTx(unprovenTx),
+      );
+
+      const serialized = provenTx.serialize();
+      const deserialized = Transaction.deserialize(
+        'signature' as const,
+        'proof' as const,
+        'pre-binding' as const,
+        new Uint8Array(serialized),
+      );
+
+      logger.info(
+        `Starting balance with ${stateReadCount} concurrent state reads so far`,
+      );
+
+      // Balance with timeout — if contention causes hang, this will detect it
+      const balancePromise = wallet.balanceTx(deserialized);
+      const { result, timedOut, elapsedMs } = await withTimeout(
+        'balanceTx-with-contention',
+        balancePromise,
+        BALANCE_TIMEOUT_MS,
+      );
+
+      logger.info(`Concurrent state reads during balance: ${stateReadCount}`);
+
+      if (timedOut) {
+        logger.error(
+          `BUG REPRODUCED: balanceTx hung for ${(elapsedMs / 1000).toFixed(1)}s ` +
+          `with concurrent state reads (${stateReadCount} reads). ` +
+          `This confirms SubscriptionRef semaphore contention hypothesis.`,
+        );
+        expect.fail(
+          `balanceTx hung for ${BALANCE_TIMEOUT_MS / 1000}s with concurrent ` +
+          `state reads — semaphore contention (${stateReadCount} reads)`,
+        );
+      } else {
+        logger.info(
+          `balanceTx with contention: completed in ${(elapsedMs / 1000).toFixed(1)}s ` +
+          `(${stateReadCount} concurrent reads). No hang — contention alone ` +
+          `doesn't reproduce. Browser-specific scheduler behavior may be required.`,
+        );
+        expect(result).toBeDefined();
+      }
+    } finally {
+      clearInterval(statePoller);
+      logger.info(`Total state reads during test: ${stateReadCount}`);
+    }
+  }, 10 * 60_000);
 });
